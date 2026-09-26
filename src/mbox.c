@@ -36,6 +36,39 @@ UBYTE __req[256];
 
 static inline uint32_t LE32(uint32_t x) { return __builtin_bswap32(x); }
 
+/* Full hardware reset via the BCM283x/2711 Power Management watchdog block,
+   NOT the VC4 property mailbox - confirmed against the real hardware address
+   in the devicetree (/soc/watchdog@7e100000, aliased as "watchdog", reg
+   "pm" at VC4 bus offset 0x7e100000). Emu68 maps this peripheral block at a
+   fixed window (0xF2000000 + the VC4 offset), same as Emu68Reboot's own
+   proven implementation - no devicetree walk needed at runtime */
+#define PM_WDOG_MAGIC   (0x5A000000)
+#define PM_RSTC_FULLRST (0x00000020)
+#define PM_RSTC ((volatile ULONG*)(0xF2000000 + 0x0010001C))
+#define PM_RSTS ((volatile ULONG*)(0xF2000000 + 0x00100020))
+#define PM_WDOG ((volatile ULONG*)(0xF2000000 + 0x00100024))
+
+/* Never returns: arms the watchdog for a near-immediate full chip reset,
+   then spins until it fires. kill_exec mirrors Emu68Reboot's KILLEXEC
+   option (clear the AmigaOS ExecBase pointer at 0x4 first) - unused by
+   EmuControl's menu action, but kept for parity with the reference tool */
+void reboot_rpi_firmware(BOOL kill_exec)
+{
+    ULONG rsts;
+
+    Disable();
+
+    if (kill_exec)
+        *((volatile ULONG *)(0x00000004)) = 0;
+
+    rsts = LE32(*PM_RSTS) & ~0xfffffaaa;
+    *PM_RSTS = LE32(PM_WDOG_MAGIC | rsts);
+    *PM_WDOG = LE32(PM_WDOG_MAGIC | 10);
+    *PM_RSTC = LE32(PM_WDOG_MAGIC | PM_RSTC_FULLRST);
+
+    for (;;);
+}
+
 static uint32_t mbox_recv(uint32_t channel)
 {
     volatile uint32_t *mbox_read = (uint32_t*)(MailBox);
@@ -585,6 +618,50 @@ void get_framebuffer_size(ULONG *width, ULONG *height)
 
         if (width) *width = LE32(FBReq[5]);
         if (height) *height = LE32(FBReq[6]);
+    }
+}
+
+/* Resets the onboard USB (xHCI/VL805) controller via the VC4 firmware, same
+   mechanism as Linux's reset-raspberrypi.c driver: devicetree confirms
+   /soc/firmware/reset (compatible "raspberrypi,firmware-reset", #reset-cells
+   = 1) is the reset line USB references (its "resets" property points at
+   that node's phandle with cell id 0). The firmware always resets with a
+   fixed 0 payload regardless of that id - there's only one reset line */
+void reset_usb_controller()
+{
+    if (MailboxBase)
+    {
+        ULONG *FBReq = (ULONG*)__req;
+
+        FBReq[0] = 4*7;
+        FBReq[1] = 0;
+        FBReq[2] = 0x00030058; /* RPI_FIRMWARE_NOTIFY_XHCI_RESET */
+        FBReq[3] = 4;
+        FBReq[4] = 0;
+        FBReq[5] = 0;
+        FBReq[6] = 0;
+
+        MB_RawCommand(FBReq);
+    }
+    else
+    {
+        struct ExecBase *SysBase = *(struct ExecBase **)4;
+
+        ULONG *FBReq = (ULONG*)(((ULONG)__req + 31) & ~31);
+        ULONG len = 7*4;
+
+        FBReq[0] = LE32(4*7);
+        FBReq[1] = 0;
+        FBReq[2] = LE32(0x00030058);
+        FBReq[3] = LE32(4);
+        FBReq[4] = 0;
+        FBReq[5] = 0;
+        FBReq[6] = 0;
+
+        CachePreDMA(FBReq, &len, 0);
+        mbox_send(8, (ULONG)FBReq);
+        mbox_recv(8);
+        CachePostDMA(FBReq, &len, 0);
     }
 }
 

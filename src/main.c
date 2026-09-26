@@ -69,7 +69,7 @@ Object *Label68k, *LabelPPC, *LabelARM, *LabelEff, *CPUGroup;
 Object *MainContentGroup, *StatusPageGroup, *CPUFrame, *RPiFrame, *CacheFrame, *StatusSpacer;
 Object *JITCount, *EnableDebug, *EnableDisasm, *DebugMin, *DebugMax, *CoreTemp, *CoreVolt, *CCRDepth;
 Object *MenuOpen, *MenuSaveAs, *MenuQuit, *MenuDefaults;
-Object *MenuIconify, *MenuSaveWinPos, *MenuMUISettings, *MenuAbout, *MenuAboutMUI;
+Object *MenuIconify, *MenuSaveWinPos, *MenuMUISettings, *MenuAbout, *MenuAboutMUI, *MenuReboot;
 Object *MenuShow68k, *MenuShowPPC, *MenuShowARM, *MenuShowEff, *MenuCompactMode;
 
 /*
@@ -1567,6 +1567,84 @@ ULONG ResetToDefaults()
     return 0;
 }
 
+/* Best-effort: asks every mounted volume to write back cached modifications
+   (e.g. delayed writes on PFS/SFS). Failures are silently ignored, since
+   ACTION_FLUSH is not guaranteed to be honored by every file system.
+   From Emu68Reboot's FlushPendingDiskWrites() */
+static void FlushPendingDiskWrites(void)
+{
+    struct DosList *dol;
+
+    dol = LockDosList(LDF_VOLUMES | LDF_READ);
+
+    while ((dol = NextDosEntry(dol, LDF_VOLUMES | LDF_READ)))
+    {
+        if (dol->dol_Task)
+            DoPkt(dol->dol_Task, ACTION_FLUSH, 0, 0, 0, 0, 0);
+    }
+
+    UnLockDosList(LDF_VOLUMES | LDF_READ);
+}
+
+/* Polls every mounted volume until none report ID_VALIDATING, i.e. any
+   ongoing write/validation has finished. From Emu68Reboot's
+   WaitForDiskActivity() (its CTRL_C early-out is dropped here: there is no
+   Shell process to send a break signal to a GUI button click) */
+static void WaitForDiskActivity(void)
+{
+    for (;;)
+    {
+        struct DosList *dol;
+        BOOL busy = FALSE;
+
+        dol = LockDosList(LDF_VOLUMES | LDF_READ);
+
+        while ((dol = NextDosEntry(dol, LDF_VOLUMES | LDF_READ)))
+        {
+            if (dol->dol_Task)
+            {
+                struct InfoData info;
+
+                if (DoPkt(dol->dol_Task, ACTION_DISK_INFO, MKBADDR(&info), 0, 0, 0, 0))
+                {
+                    if (info.id_DiskState == ID_VALIDATING)
+                    {
+                        busy = TRUE;
+                        break;
+                    }
+                }
+            }
+        }
+
+        UnLockDosList(LDF_VOLUMES | LDF_READ);
+
+        if (!busy)
+            return;
+
+        Delay(50);
+    }
+}
+
+/* Confirms with the user, flushes and waits for disk activity to settle,
+   then triggers a full Raspberry Pi firmware reboot (reboot_rpi_firmware()
+   in mbox.c) - never returns if confirmed */
+ULONG DoRebootRPi()
+{
+    if (MUI_Request(app, MainWindow, 0,
+        "Reboot",
+        "Reboot|Cancel",
+        "This will reboot your Raspberry Pi firmware, Emu68 will restart completely.\nAll pending disk operations will be flushed before rebooting."))
+    {
+        Delay(50);
+		FlushPendingDiskWrites();
+        WaitForDiskActivity();
+        Delay(50);
+        reboot_rpi_firmware(FALSE);
+    }
+
+    return 0;
+}
+
 /* Rebuilds CPUGroup's member list from scratch in canonical order, keeping
    only the rows whose "Edit" menu checkbox is on. Removing every row first
    and re-adding the visible ones (rather than leaving untouched rows alone)
@@ -1732,6 +1810,10 @@ struct Hook hook_BlitWait = {
 
 struct Hook hook_ResetToDefaults = {
     .h_Entry = ResetToDefaults
+};
+
+struct Hook hook_RebootRPi = {
+    .h_Entry = DoRebootRPi
 };
 
 struct Hook hook_RebuildCPURows = {
@@ -2163,6 +2245,12 @@ void MUIMain()
                         MUIA_Family_Child, MenuitemObject,
                             MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
                         End,
+                        MUIA_Family_Child, MenuReboot = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Reboot the RPi...",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
                         MUIA_Family_Child, MenuIconify = MenuitemObject,
                             MUIA_Menuitem_Title, (ULONG)"Iconify",
                             MUIA_Menuitem_Shortcut, (ULONG)"I",
@@ -2567,6 +2655,9 @@ void MUIMain()
             DoMethod(MenuSaveAs, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_SavePreset);
 
+            DoMethod(MenuReboot, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_RebootRPi);
+
             DoMethod(MenuIconify, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 3, MUIM_Set, MUIA_Application_Iconified, TRUE);
 
@@ -2760,7 +2851,7 @@ void GUIMain()
     }
 }
 
-#define RDA_TEMPLATE "LOAD/K,ICNT=InstructionCount/K/N,IRNG=InliningRange/K/N,LCNT=LoopCount/K/N,CACHE/S,NOCACHE/S,SC=SlowdownCHIP/S,NSC=NoSlowdownCHIP/S,SCS=SlowCHIPSpacing/K/N,DBF=SlowdownDBF/S,NDBF=NoSlowdownDBF/S,SF=SoftFlush/S,SFL=SoftFlushLimit/K/N,CCRD=CCRScanDepth/K/N,BW=BlitWait/S,NBW=NoBlitWait/S,GUI/S,S=Silent/S,DEF=LoadDefaults/S,PREVIEW/S"
+#define RDA_TEMPLATE "LOAD/K,ICNT=InstructionCount/K/N,IRNG=InliningRange/K/N,LCNT=LoopCount/K/N,CACHE/S,NOCACHE/S,SC=SlowdownCHIP/S,NSC=NoSlowdownCHIP/S,SCS=SlowCHIPSpacing/K/N,DBF=SlowdownDBF/S,NDBF=NoSlowdownDBF/S,SF=SoftFlush/S,SFL=SoftFlushLimit/K/N,CCRD=CCRScanDepth/K/N,BW=BlitWait/S,NBW=NoBlitWait/S,GUI/S,S=Silent/S,DEF=LoadDefaults/S,PREVIEW/S,HardReset/S"
 
 enum {
     OPT_PRESET_LOAD,
@@ -2783,6 +2874,7 @@ enum {
     OPT_SILENT,
     OPT_DEFAULTS,
     OPT_PREVIEW,
+    OPT_HARDRESET,
     OPT_COUNT
 };
 
@@ -2940,6 +3032,17 @@ int main(int wantGUI, struct WBStartup *wbmsg)
                 setBLIT_WAIT(0);
 
                 if (ssp) UserState(ssp);
+            }
+            else if (result[OPT_HARDRESET])
+            {
+                if (!silent)
+                    Printf("Rebooting the Raspberry Pi firmware...\n");
+
+                wantGUI = 0;
+
+                FlushPendingDiskWrites();
+                WaitForDiskActivity();
+                reboot_rpi_firmware(FALSE);
             }
             else
             {
