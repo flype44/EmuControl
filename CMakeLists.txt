@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14.0)
-project(EmuControl VERSION 1.5.0)
+project(EmuControl VERSION 1.6.0)
 
 include(cmake/verstring.cmake)
 get_verstring(VERSTRING)
@@ -17,11 +17,12 @@ add_executable(EmuControl
     src/main.c
     src/mbox.c
     src/presets.c
+    src/emulogo.c
 )
 
 target_link_options(EmuControl PRIVATE -ffreestanding -m68040 -nostdlib -nostartfiles -Wl,-e,__start)
 target_compile_options(EmuControl PRIVATE -Os -m68040 -m68881 -fomit-frame-pointer)
-target_compile_definitions(EmuControl PRIVATE VERSION_STRING="${VERSTRING}")
+target_compile_definitions(EmuControl PRIVATE VERSION_STRING="${VERSTRING}" APP_VERSION="${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 target_include_directories(EmuControl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(EmuControl mui amiga devicetree mailbox)
 

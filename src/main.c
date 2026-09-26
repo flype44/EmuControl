@@ -4,13 +4,16 @@
 #include <intuition/screens.h>
 #include <intuition/classes.h>
 #include <workbench/startup.h>
+#include <workbench/workbench.h>
 #include <graphics/gfxbase.h>
 #include <graphics/gfx.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <dos/rdargs.h>
+#include <dos/datetime.h>
 #include <libraries/mui.h>
 #include <libraries/asl.h>
+#include <libraries/gadtools.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/graphics.h>
@@ -19,6 +22,7 @@
 #include <proto/devicetree.h>
 #include <proto/asl.h>
 #include <proto/mailbox.h>
+#include <proto/icon.h>
 #include <clib/muimaster_protos.h>
 #include <clib/alib_protos.h>
 #include <utility/tagitem.h>
@@ -29,6 +33,7 @@
 
 #include "mbox.h"
 #include "presets.h"
+#include "emulogo.h"
 
 struct ExecBase *       SysBase;
 struct IntuitionBase *  IntuitionBase;
@@ -36,18 +41,31 @@ struct GfxBase *        GfxBase;
 struct Library *        GadToolsBase;
 struct DosLibrary *     DOSBase;
 struct Library *        MUIMasterBase;
+struct Library *        IconBase;
 APTR                    MailboxBase;
 APTR                    MailBox;
+
+/* Icon tooltype defaults for the Status page "Edit" menu checkboxes -
+   overridden from HIDE68KSTATUS/HIDEPPCSTATUS/HIDEARMSTATUS/HIDEEFFICIENCY
+   tooltypes when launched from Workbench, see ReadShowToolTypes() */
+BOOL Show68kDefault = TRUE;
+BOOL ShowPPCDefault = TRUE;
+BOOL ShowARMDefault = TRUE;
+BOOL ShowEffDefault = TRUE;
 
 #define APPNAME "EmuControl"
 
 static const char version[] __attribute__((used)) = "$VER: " VERSION_STRING;
+static const char stack[] __attribute__((used)) = "$STACK: 16384";
 
 Object *app;
 Object *MainWindow, *INSNDepth, *InlineRange, *LoopCount, *SoftFlush, *CacheFlush, *FastCache, *SlowCHIP, *SlowDBF, *BlitWait;
-Object *TabGroup, *MIPS_M68k, *MIPS_ARM, *JITUsage, *Effectiveness, *CacheMiss, *SoftThresh;
+Object *TabGroup, *MIPS_M68k, *MIPS_PPC, *MIPS_ARM, *JITUsage, *Effectiveness, *CacheMiss, *SoftThresh, *ClockRate;
+Object *Label68k, *LabelPPC, *LabelARM, *LabelEff, *CPUGroup;
 Object *JITCount, *EnableDebug, *EnableDisasm, *DebugMin, *DebugMax, *CoreTemp, *CoreVolt, *CCRDepth;
 Object *MenuOpen, *MenuSaveAs, *MenuQuit, *MenuDefaults;
+Object *MenuIconify, *MenuSaveWinPos, *MenuMUISettings, *MenuAbout, *MenuAboutMUI;
+Object *MenuShow68k, *MenuShowPPC, *MenuShowARM, *MenuShowEff;
 
 /*
     Some properties, like e.g. #size-cells, are not always available in a key, but in that case the properties
@@ -204,6 +222,11 @@ static inline unsigned long long getM68kCount()
     } while(tmp != u.u32[0]);
     
     return u.u64;
+}
+
+unsigned long long getPPCCount()
+{
+    return 0;
 }
 
 static inline ULONG getJITSize()
@@ -858,10 +881,12 @@ ULONG update()
 
     static unsigned long long old_cnt = 0;
     static unsigned long long old_arm_cnt = 0;
+    static unsigned long long old_ppc_cnt = 0;
     static unsigned long long old_m68k_cnt = 0;
     static ULONG old_cmiss;
 
     unsigned long long arm_cnt = getARMCount();
+    unsigned long long ppc_cnt = getPPCCount();
     unsigned long long m68k_cnt = getM68kCount();
     unsigned long long cnt = getCounter();
 
@@ -874,20 +899,26 @@ ULONG update()
     if (ssp)
         UserState(ssp);
 
-    if (old_arm_cnt != 0 && old_m68k_cnt != 0) {
+    if (old_arm_cnt != 0 && old_m68k_cnt != 0 && cnt_speed != 0) {
         ULONG delta_arm = arm_cnt - old_arm_cnt;
+        ULONG delta_ppc = ppc_cnt - old_ppc_cnt;
         ULONG delta_m68k = m68k_cnt - old_m68k_cnt;
         ULONG delta_cnt = (cnt - old_cnt);
         ULONG gauge_max;
         ULONG delta_cmiss = cmiss - old_cmiss;
 
-        ULONG mips_arm, mips_m68k, cmiss_ps;
+        ULONG mips_arm, mips_m68k, mips_ppc, cmiss_ps;
 
         // Use divu directly. Doing that in C will make gcc pull 32-bit division for some reason
         asm volatile("divu.l %1, %0":"=r"(delta_cnt):"r"(cnt_speed),"0"(delta_cnt));
+        if (delta_cnt == 0)
+            delta_cnt = 1; /* avoid divu-by-zero below on a very fast poll tick */
         asm volatile("divu.l %1, %0":"=r"(mips_arm):"r"(delta_cnt),"0"(delta_arm));
+        asm volatile("divu.l %1, %0":"=r"(mips_ppc):"r"(delta_cnt),"0"(delta_ppc));
         asm volatile("divu.l %1, %0":"=r"(mips_m68k):"r"(delta_cnt),"0"(delta_m68k));
         delta_cnt /= 1000;
+        if (delta_cnt == 0)
+            delta_cnt = 1;
         asm volatile("divu.l %1, %0":"=r"(cmiss_ps):"r"(delta_cnt),"0"(delta_cmiss));
 
         get(MIPS_ARM, MUIA_Gauge_Max, &gauge_max);
@@ -895,13 +926,21 @@ ULONG update()
             set(MIPS_ARM, MUIA_Gauge_Max, mips_arm);
         set(MIPS_ARM, MUIA_Gauge_Current, mips_arm);
 
+        get(MIPS_PPC, MUIA_Gauge_Max, &gauge_max);
+        if (mips_ppc > gauge_max)
+            set(MIPS_PPC, MUIA_Gauge_Max, mips_ppc);
+        set(MIPS_PPC, MUIA_Gauge_Current, mips_ppc);
+
         get(MIPS_M68k, MUIA_Gauge_Max, &gauge_max);
         if (mips_m68k > gauge_max)
             set(MIPS_M68k, MUIA_Gauge_Max, mips_m68k);
         set(MIPS_M68k, MUIA_Gauge_Current, mips_m68k);
 
-        ULONG eff = (ULONG)(100.0 * (double)delta_m68k / (double)delta_arm);
-        set(Effectiveness, MUIA_Gauge_Current, eff);
+        if (delta_arm != 0)
+        {
+            ULONG eff = (ULONG)(100.0 * (double)delta_m68k / (double)delta_arm);
+            set(Effectiveness, MUIA_Gauge_Current, eff);
+        }
 
         get(CacheMiss, MUIA_Gauge_Max, &gauge_max);
         if (cmiss_ps > gauge_max)
@@ -914,31 +953,51 @@ ULONG update()
         set(JITCount, MUIA_Gauge_Current, jit_count);
     }
 
-    ULONG jit_used = 100 * (jit_total - jit_free) / jit_total;
+    if (jit_total != 0)
+    {
+        ULONG jit_used = 100 * (jit_total - jit_free) / jit_total;
+        set(JITUsage, MUIA_Gauge_Current, jit_used);
+    }
 
-    set(JITUsage, MUIA_Gauge_Current, jit_used);
-
-    if (MailBox)
+    if (MailBox || MailboxBase)
     {
         ULONG temp = get_core_temperature();
         LONG volt = get_core_voltage();
-        static char str_temp[10];
-        static char str_volt[10];
+        ULONG gauge_max;
 
         if (temp != 0)
         {
-            temp = (temp + 50) / 100;
+            ULONG temp_c = (temp + 500) / 1000;
 
-            _sprintf(str_temp, "%ld.%ld", temp / 10, temp % 10);
-
-            set(CoreTemp, MUIA_Text_Contents, (ULONG)str_temp);
+            get(CoreTemp, MUIA_Gauge_Max, &gauge_max);
+            if (temp_c > gauge_max)
+                set(CoreTemp, MUIA_Gauge_Max, temp_c);
+            set(CoreTemp, MUIA_Gauge_Current, temp_c);
         }
 
         if (volt != 0)
         {
-            _sprintf(str_volt, "%ld mV", (volt + 500) / 1000);
+            ULONG volt_mv = (volt + 500) / 1000;
 
-            set(CoreVolt, MUIA_Text_Contents, (ULONG)str_volt);
+            get(CoreVolt, MUIA_Gauge_Max, &gauge_max);
+            if (volt_mv > gauge_max)
+                set(CoreVolt, MUIA_Gauge_Max, volt_mv);
+            set(CoreVolt, MUIA_Gauge_Current, volt_mv);
+        }
+
+        /* Measured ARM clock, in MHz. The gauge's max starts at the firmware's
+           reported ceiling (already reflects a config.txt overclock, not just
+           the stock speed) and grows further if the live value ever exceeds
+           it - same auto-grow rule as every other gauge above, so no fixed
+           multiplier needs to be guessed for people running above spec */
+        ULONG clock_mhz = get_clock_rate_measured(3) / 1000000;
+
+        if (clock_mhz != 0)
+        {
+            get(ClockRate, MUIA_Gauge_Max, &gauge_max);
+            if (clock_mhz > gauge_max)
+                set(ClockRate, MUIA_Gauge_Max, clock_mhz);
+            set(ClockRate, MUIA_Gauge_Current, clock_mhz);
         }
     }
 
@@ -1154,6 +1213,63 @@ ULONG UpdaterDispatcher(REGARG(struct IClass *ic, "a0"), REGARG(Msg message, "a1
     }
     else
         return DoSuperMethodA(ic, o, message);
+}
+
+/* Custom Area subclass drawing the About-page emu logo straight from a compiled-in
+   1bpp mask (see emulogo.c) - avoids relying on datatypes.library/Dtpic, whose
+   picture remapping showed the transparent silhouette as black-on-black. At its
+   current (200x200) size the plain silhouette already looks clean, so no
+   antialiasing or emboss is applied */
+ULONG EmuLogoDispatcher(REGARG(struct IClass *ic, "a0"), REGARG(Object *o, "a2"), REGARG(Msg message, "a1"))
+{
+    switch (message->MethodID)
+    {
+        case MUIM_AskMinMax: {
+            struct MUIP_AskMinMax *m = (struct MUIP_AskMinMax *)message;
+            ULONG rc = DoSuperMethodA(ic, o, message);
+
+            m->MinMaxInfo->MinWidth  += EMULOGO_WIDTH;
+            m->MinMaxInfo->MinHeight += EMULOGO_HEIGHT;
+            m->MinMaxInfo->DefWidth  += EMULOGO_WIDTH;
+            m->MinMaxInfo->DefHeight += EMULOGO_HEIGHT;
+            m->MinMaxInfo->MaxWidth  += EMULOGO_WIDTH;
+            m->MinMaxInfo->MaxHeight += EMULOGO_HEIGHT;
+
+            return rc;
+        }
+
+        case MUIM_Draw: {
+            struct MUI_RenderInfo *mri;
+            struct RastPort *rp;
+            LONG ox, oy;
+            int x, y;
+
+            DoSuperMethodA(ic, o, message);
+
+            mri = muiRenderInfo(o);
+            rp = mri->mri_RastPort;
+            ox = _mleft(o);
+            oy = _mtop(o);
+
+            SetAPen(rp, mri->mri_Pens[MPEN_TEXT]);
+
+            for (y = 0; y < EMULOGO_HEIGHT; y++)
+            {
+                const UBYTE *row = &EmuLogoMask[y * (EMULOGO_WIDTH / 8)];
+
+                for (x = 0; x < EMULOGO_WIDTH; x++)
+                {
+                    if (row[x >> 3] & (0x80 >> (x & 7)))
+                        WritePixel(rp, ox + x, oy + y);
+                }
+            }
+
+            return 0;
+        }
+
+        default:
+            return DoSuperMethodA(ic, o, message);
+    }
 }
 
 ULONG ChangeINSNDepth()
@@ -1442,7 +1558,61 @@ ULONG ResetToDefaults()
     set(LoopCount, MUIA_Numeric_Value, 8);
     set(SoftThresh, MUIA_Numeric_Value, 500);
     set(InlineRange, MUIA_Numeric_Value, 13);
-    
+
+    return 0;
+}
+
+/* Rebuilds CPUGroup's member list from scratch in canonical order, keeping
+   only the rows whose "Edit" menu checkbox is on. Removing every row first
+   and re-adding the visible ones (rather than leaving untouched rows alone)
+   guarantees the on-screen order never drifts, since OM_ADDMEMBER always
+   appends at the end of the list */
+ULONG RebuildCPURows()
+{
+    ULONG show68k, showPPC, showARM, showEff;
+
+    get(MenuShow68k, MUIA_Menuitem_Checked, &show68k);
+    get(MenuShowPPC, MUIA_Menuitem_Checked, &showPPC);
+    get(MenuShowARM, MUIA_Menuitem_Checked, &showARM);
+    get(MenuShowEff, MUIA_Menuitem_Checked, &showEff);
+
+    DoMethod(CPUGroup, MUIM_Group_InitChange);
+
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)Label68k);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)MIPS_M68k);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)LabelPPC);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)MIPS_PPC);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)LabelARM);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)MIPS_ARM);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)LabelEff);
+    DoMethod(CPUGroup, OM_REMMEMBER, (ULONG)Effectiveness);
+
+    if (show68k)
+    {
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)Label68k);
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)MIPS_M68k);
+    }
+
+    if (showPPC)
+    {
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)LabelPPC);
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)MIPS_PPC);
+    }
+
+    if (showARM)
+    {
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)LabelARM);
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)MIPS_ARM);
+    }
+
+    if (showEff)
+    {
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)LabelEff);
+        DoMethod(CPUGroup, OM_ADDMEMBER, (ULONG)Effectiveness);
+    }
+
+    DoMethod(CPUGroup, MUIM_Group_ExitChange);
+
     return 0;
 }
 
@@ -1510,6 +1680,10 @@ struct Hook hook_ResetToDefaults = {
     .h_Entry = ResetToDefaults
 };
 
+struct Hook hook_RebuildCPURows = {
+    .h_Entry = RebuildCPURows
+};
+
 struct Hook hook_SavePreset = {
     .h_Entry = DoSavePreset
 };
@@ -1520,21 +1694,378 @@ struct Hook hook_LoadPreset = {
 
 BOOL previewOnly;
 
-static CONST_STRPTR RegisterTitles[] = { "Status", "Control", "Debug", "About", NULL };
+static CONST_STRPTR RegisterTitles[] = { "Status", "JIT", "Debug", "System", "About", NULL };
+
+/* Fixed-width label for the Status page: forces every row's label column to the
+   same width (the widest label, "Effectiveness:"), since each stat block is now
+   its own GroupFrame/ColGroup and can no longer share column sizing with the others */
+/* Reference sample is padded with trailing spaces to add ~25px of breathing
+   room over the bare "Effectiveness" text width (no exact pixel API for a
+   proportional Button-font label, so this is an approximation) */
+#define StatusLabel(text) TextObject, \
+    MUIA_Font, MUIV_Font_Button, \
+    MUIA_Text_Contents, (ULONG)(text), \
+    MUIA_Text_PreParse, (ULONG)MUIX_R, \
+    MUIA_FixWidthTxt, (ULONG)"Effectiveness    ", \
+    End
+
+/* Fixed-width label for the System page, same rationale as StatusLabel */
+#define InfoLabel(text) TextObject, \
+    MUIA_Font, MUIV_Font_Button, \
+    MUIA_Text_Contents, (ULONG)(text), \
+    MUIA_Text_PreParse, (ULONG)MUIX_R, \
+    MUIA_FixWidthTxt, (ULONG)"Serial-number:", \
+    End
+
+/* Read-only value field for the System page - framed like a disabled string gadget */
+#define InfoValue(text) TextObject, \
+    TextFrame, \
+    MUIA_Background, MUII_TextBack, \
+    MUIA_Text_Contents, (ULONG)(text), \
+    End
+
+/* Layout of the devicetree "/emu68"/"version" property, see Emu68Version */
+struct Emu68VersionStruct {
+    ULONG ver_major;
+    ULONG ver_minor;
+    ULONG ver_patch;
+};
+
+/* Reads the running Emu68 core's version from the devicetree, as Emu68Version does */
+static void GetEmu68VersionLine(char *buf)
+{
+    APTR DeviceTreeBase = OpenResource("devicetree.resource");
+    APTR key;
+
+    _sprintf(buf, "Emu68 (version unavailable)");
+
+    if (DeviceTreeBase && (key = DT_OpenKey("/emu68")))
+    {
+        APTR prop = DT_FindProperty(key, "version");
+
+        if (prop)
+        {
+            struct Emu68VersionStruct *ver = (struct Emu68VersionStruct *)DT_GetPropValue(prop);
+
+            _sprintf(buf, "Emu68 version %ld.%ld.%ld", ver->ver_major, ver->ver_minor, ver->ver_patch);
+        }
+
+        DT_CloseKey(key);
+    }
+}
+
+/* Generic devicetree string property reader, as used throughout Emu68About */
+static CONST_STRPTR GetDTString(CONST_STRPTR path, CONST_STRPTR name, CONST_STRPTR fallback)
+{
+    APTR DeviceTreeBase = OpenResource("devicetree.resource");
+    APTR key;
+    CONST_STRPTR value = fallback;
+
+    if (DeviceTreeBase && (key = DT_OpenKey(path)))
+    {
+        APTR prop = DT_FindProperty(key, name);
+
+        if (prop)
+        {
+            CONST_STRPTR found = DT_GetPropValue(prop);
+            if (found)
+                value = found;
+        }
+
+        DT_CloseKey(key);
+    }
+
+    return value;
+}
+
+/* Formats a byte size as "N.NN unit", same integer-only scaling as Emu68About's PrintSize() */
+static void FormatSize(char *buf, ULONG bytes)
+{
+    static const char *units[] = { "B", "KB", "MB", "GB" };
+    ULONG frac = 0;
+    int unit = 0;
+
+    while (bytes >= 1024 && unit < 3)
+    {
+        frac = bytes & 1023;
+        bytes >>= 10;
+        unit++;
+    }
+
+    frac = (frac * 100) / 1024;
+
+    _sprintf(buf, "%ld.%02ld %s", bytes, frac, units[unit]);
+}
+
+/* Formats a Hz value as "N.N unit", same integer-only scaling as Emu68About's GetFrequency() */
+static void FormatFrequency(char *buf, ULONG hz)
+{
+    static const char *units[] = { "Hz", "KHz", "MHz", "GHz" };
+    ULONG frac = 0;
+    int unit = 0;
+
+    while (hz >= 1000 && unit < 3)
+    {
+        frac = hz % 1000;
+        hz /= 1000;
+        unit++;
+    }
+
+    frac /= 100;
+
+    _sprintf(buf, "%ld.%ld %s", hz, frac, units[unit]);
+}
+
+/* Same integer-only whole-unit size formatter as FormatSize, but without
+   decimals - used for the compact "Memory size" line on the System page */
+static void FormatSizeWhole(char *buf, ULONG bytes)
+{
+    static const char *units[] = { "B", "KB", "MB", "GB" };
+    int unit = 0;
+
+    while (bytes >= 1024 && unit < 3)
+    {
+        bytes >>= 10;
+        unit++;
+    }
+
+    _sprintf(buf, "%ld %s", bytes, units[unit]);
+}
+
+/* Finds "key" in a devicetree bootargs-style string and parses the number that
+   immediately follows it, in the given base (10 or 16) - same idea as
+   Emu68Info's GetField(), hand-rolled since this freestanding build has no
+   strstr()/strtol() */
+static LONG GetBootArgField(CONST_STRPTR bootargs, const char *key, int base)
+{
+    CONST_STRPTR h = bootargs;
+
+    if (!h)
+        return 0;
+
+    while (*h)
+    {
+        CONST_STRPTR hh = h;
+        const char *kk = key;
+
+        while (*kk && *hh == *kk) { hh++; kk++; }
+
+        if (*kk == 0)
+        {
+            LONG value = 0;
+
+            while (*hh)
+            {
+                int digit;
+
+                if (*hh >= '0' && *hh <= '9') digit = *hh - '0';
+                else if (base == 16 && *hh >= 'a' && *hh <= 'f') digit = *hh - 'a' + 10;
+                else if (base == 16 && *hh >= 'A' && *hh <= 'F') digit = *hh - 'A' + 10;
+                else break;
+
+                value = value * base + digit;
+                hh++;
+            }
+
+            return value;
+        }
+
+        h++;
+    }
+
+    return 0;
+}
+
+/* 64-bit-by-32-bit unsigned division using the 68020+/68040 extended divu.l,
+   the same single instruction as Emu68Info's asm_div64() */
+static ULONG Div64(ULONG lo, ULONG hi, ULONG divisor)
+{
+    asm volatile("divu.l %2,%1:%0" : "+d"(lo), "+d"(hi) : "d"(divisor));
+    return lo;
+}
+
+/* Elapsed time since the JIT's free-running counter started, reusing the same
+   movec counter/frequency EmuControl already reads for the MIPS gauges -
+   equivalent to Emu68Info's GetBootTime()/GetBootTime2(), no extra asm needed */
+static void GetUptimeLine(char *buf)
+{
+    APTR ssp;
+    unsigned long long cnt;
+    ULONG freq;
+    ULONG seconds, h, m, s;
+
+    ssp = SuperState();
+    cnt = getCounter();
+    freq = getCounterSpeed();
+    if (ssp)
+        UserState(ssp);
+
+    seconds = freq ? Div64((ULONG)cnt, (ULONG)(cnt >> 32), freq) : 0;
+
+    h = seconds / 3600;
+    s = seconds % 3600;
+    m = s / 60;
+    s = s % 60;
+
+    _sprintf(buf, "%ldh %ldm %lds (%ld secs)", h, m, s, seconds);
+}
+
+/* VC4 firmware build date, converted from Unix to Amiga epoch as Emu68About's GetFirmware() does */
+static void GetFirmwareDateLine(char *buf)
+{
+    ULONG seconds = get_firmware_revision();
+    struct DateTime dt;
+    UBYTE strDate[LEN_DATSTRING];
+    UBYTE strTime[LEN_DATSTRING];
+
+    _sprintf(buf, "unavailable");
+
+    if (seconds != 0)
+    {
+        seconds -= 252460800; /* Unix epoch (1970) -> Amiga epoch (1978) */
+
+        dt.dat_Format  = FORMAT_DEF;
+        dt.dat_Flags   = 0;
+        dt.dat_StrDay  = NULL;
+        dt.dat_StrDate = strDate;
+        dt.dat_StrTime = strTime;
+        dt.dat_Stamp.ds_Days   = seconds / (24 * 60 * 60);
+        dt.dat_Stamp.ds_Minute = (seconds % (24 * 60 * 60)) / 60;
+        dt.dat_Stamp.ds_Tick   = (seconds % 60) * 50;
+
+        if (DateToStr(&dt))
+            _sprintf(buf, "%s %s", strDate, strTime);
+    }
+}
+
+/* Text fields for the System page's single "Information" block */
+struct SystemPageInfo {
+    char variant[64];
+    char model[64];
+    char revision[32];
+    char chipset[32];
+    char manufacturer[32];
+    char processor[64];
+    char memory[64];
+    char frame[48];
+    char firmware[40];
+    char uptime[48];
+    char serial[24];
+    char mac[24];
+    char turbo[16];
+    char overVoltage[16];
+};
+
+/* Decodes the mailbox board revision word and gathers every System page field,
+   following Emu68Info's GetBoard() bit layout and lookup tables */
+static void GetSystemPageInfo(struct SystemPageInfo *info)
+{
+    static const char *boardType[] = {
+        "1 Model A", "1 Model B", "1 Model A Plus", "1 Model B Plus",
+        "2 Model B", "Alpha", "Compute Module 1", "2 Model A",
+        "3 Model B", "Zero", "Compute Module 3", "Unknown",
+        "Zero W", "3 Model B Plus", "3 Model A Plus", "Unknown",
+        "Compute Module 3 Plus", "4 Model B", "Zero 2 W", "400",
+        "Compute Module 4", "Unknown",
+    };
+    static const char *chipsetName[] = {
+        "BCM2835 (VC4)", "BCM2836 (VC4)", "BCM2837 (VC4)",
+        "BCM2711 (VC6)", "BCM???? (VC6)", "Unknown",
+    };
+    static const char *manufacturerName[] = {
+        "Sony UK", "Egoman", "Embest", "Sony Japan", "Embest", "Stadium", "Unknown",
+    };
+
+    CONST_STRPTR variant = GetDTString("/emu68", "variant", "unknown");
+    CONST_STRPTR cpu = GetDTString("/cpus/cpu@0", "compatible", "unknown");
+    CONST_STRPTR bootargs = GetDTString("/chosen", "bootargs", NULL);
+
+    ULONG rev = get_board_revision();
+    ULONG overVoltage = (rev >> 31) & 1;
+    ULONG manufacturer = (rev >> 16) & 0xf;
+    ULONG processor = (rev >> 12) & 0xf;
+    ULONG type = (rev >> 4) & 0xff;
+    ULONG revision = rev & 0xf;
+
+    ULONG hi, lo;
+    char sizeRPI[16], sizeARM[16], sizeGPU[16];
+    char freqStr[24];
+
+    _sprintf(info->variant, "%s", variant);
+
+    _sprintf(info->revision, "%lx (id: %ld)", rev & 0x00ffffff, type);
+
+    _sprintf(info->model, "Raspberry Pi %s Rev 1.%ld",
+        type < 22 ? boardType[type] : boardType[21], revision);
+
+    _sprintf(info->chipset, "%s", processor < 6 ? chipsetName[processor] : chipsetName[5]);
+
+    _sprintf(info->manufacturer, "%s", manufacturer < 7 ? manufacturerName[manufacturer] : manufacturerName[6]);
+
+    FormatFrequency(freqStr, get_clock_rate(3));
+    _sprintf(info->processor, "%s @ %s", cpu, freqStr);
+
+    {
+        ULONG armMem = get_arm_memory_size();
+        ULONG vcMem = get_vc_memory_size();
+
+        /* bootargs ".mem_size=" isn't reliably present, so total from the
+           mailbox-reported ARM+GPU split instead - always available */
+        FormatSizeWhole(sizeRPI, armMem + vcMem);
+        FormatSizeWhole(sizeARM, armMem);
+        FormatSizeWhole(sizeGPU, vcMem);
+    }
+    _sprintf(info->memory, "RPI %s, ARM %s, GPU %s", sizeRPI, sizeARM, sizeGPU);
+
+    FormatFrequency(freqStr, get_clock_rate_measured(9));
+    _sprintf(info->frame, "%ld x %ld @ %s",
+        GetBootArgField(bootargs, ".fbwidth=", 10),
+        GetBootArgField(bootargs, ".fbheight=", 10),
+        freqStr);
+
+    GetFirmwareDateLine(info->firmware);
+    GetUptimeLine(info->uptime);
+
+    get_board_serial(&hi, &lo);
+    _sprintf(info->serial, "%08lx%08lx", lo, hi);
+
+    get_board_macaddr(&hi, &lo);
+    _sprintf(info->mac, "%02lx:%02lx:%02lx:%02lx:%02lx:%02lx",
+        (hi >> 24) & 0xff, (hi >> 16) & 0xff, (hi >> 8) & 0xff, hi & 0xff,
+        (lo >> 24) & 0xff, (lo >> 16) & 0xff);
+
+    _sprintf(info->turbo, "%s", get_turbo_mode() == 0 ? "Disabled" : "Enabled");
+    _sprintf(info->overVoltage, "%s", overVoltage ? "Enabled" : "Disabled");
+}
 
 void MUIMain()
 {
     struct MUI_CustomClass *logSlider = MUI_CreateCustomClass(NULL, MUIC_Slider, NULL, 4, SliderDispatcher);
     struct MUI_CustomClass *updater = MUI_CreateCustomClass(NULL, MUIC_Area, NULL, 4, UpdaterDispatcher);
+    struct MUI_CustomClass *emuLogo = MUI_CreateCustomClass(NULL, MUIC_Area, NULL, 4, EmuLogoDispatcher);
 
     Object *updaterObj;
     struct MUI_InputHandlerNode ihn;
-    
+    static char emu68VersionLine[64];
+    static char aboutBody[256];
+    static struct SystemPageInfo sysInfo;
+
+    GetEmu68VersionLine(emu68VersionLine);
+    _sprintf(aboutBody,
+        "\33cEmu68 JIT control panel\n"
+        "\33cRunning on %s\n\n"
+        "\33c\0333Copyright 2022-2026\n"
+		"Michal Schulz and Claude Schwarz"
+		"\33n",
+        emu68VersionLine);
+
+    GetSystemPageInfo(&sysInfo);
+
     if (logSlider) {
         app = ApplicationObject, 
                 MUIA_Application_Title, (ULONG)APPNAME,
                 MUIA_Application_Version, (ULONG)version,
-                MUIA_Application_Copyright, (ULONG)"(C) 2022-2023 Michal Schulz",
+                MUIA_Application_Copyright, (ULONG)"(C) 2022-2026 Michal Schulz",
                 MUIA_Application_Author, (ULONG)"Michal Schulz",
                 MUIA_Application_Description, (ULONG)APPNAME,
                 MUIA_Application_Base, (ULONG)"EMUCONTROL",
@@ -1544,24 +2075,85 @@ void MUIMain()
                     MUIA_Family_Child, MenuObject,
                         MUIA_Menu_Title, (ULONG)"Project",
                         MUIA_Family_Child, MenuOpen = MenuitemObject,
-                            MUIA_Menuitem_Title, (ULONG)"Open",
+                            MUIA_Menuitem_Title, (ULONG)"Open...",
+                            MUIA_Menuitem_Shortcut, (ULONG)"O",
                         End,
                         MUIA_Family_Child, MenuSaveAs = MenuitemObject,
-                            MUIA_Menuitem_Title, (ULONG)"Save As",
+                            MUIA_Menuitem_Title, (ULONG)"Save As...",
+                            MUIA_Menuitem_Shortcut, (ULONG)"A",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
+                        MUIA_Family_Child, MenuMUISettings = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Open MUI Settings...",
+                        End,
+                        MUIA_Family_Child, MenuSaveWinPos = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Save MUI settings",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
+                        MUIA_Family_Child, MenuAboutMUI = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"About MUI",
+                        End,
+                        MUIA_Family_Child, MenuAbout = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"About EmuControl",
+                            MUIA_Menuitem_Shortcut, (ULONG)"?",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
+                        MUIA_Family_Child, MenuIconify = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Iconify",
+                            MUIA_Menuitem_Shortcut, (ULONG)"I",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
                         End,
                         MUIA_Family_Child, MenuQuit = MenuitemObject,
                             MUIA_Menuitem_Title, (ULONG)"Quit",
+                            MUIA_Menuitem_Shortcut, (ULONG)"Q",
                         End,
                     End,
                     MUIA_Family_Child, MenuObject,
                         MUIA_Menu_Title, (ULONG)"Edit",
                         MUIA_Family_Child, MenuDefaults = MenuitemObject,
-                            MUIA_Menuitem_Title, (ULONG)"Reset to Defaults",
+                            MUIA_Menuitem_Title, (ULONG)"Reset to defaults",
+                            MUIA_Menuitem_Shortcut, (ULONG)"R",
+                        End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
+                        MUIA_Family_Child, MenuShow68k = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Display 68K status",
+                            MUIA_Menuitem_Checkit, TRUE,
+                            MUIA_Menuitem_Toggle, TRUE,
+                            MUIA_Menuitem_Checked, Show68kDefault,
+                        End,
+                        MUIA_Family_Child, MenuShowPPC = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Display PPC status",
+                            MUIA_Menuitem_Checkit, TRUE,
+                            MUIA_Menuitem_Toggle, TRUE,
+                            MUIA_Menuitem_Checked, ShowPPCDefault,
+                        End,
+                        MUIA_Family_Child, MenuShowARM = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Display ARM status",
+                            MUIA_Menuitem_Checkit, TRUE,
+                            MUIA_Menuitem_Toggle, TRUE,
+                            MUIA_Menuitem_Checked, ShowARMDefault,
+                        End,
+                        MUIA_Family_Child, MenuShowEff = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Display efficiency",
+                            MUIA_Menuitem_Checkit, TRUE,
+                            MUIA_Menuitem_Toggle, TRUE,
+                            MUIA_Menuitem_Checked, ShowEffDefault,
                         End,
                     End,
                 End,
 
                 SubWindow, MainWindow = WindowObject,
+                    MUIA_Window_ID, 0x4D41494E, /* 'MAIN' - lets MUI persist position/size */
                     MUIA_Window_Title, (ULONG)APPNAME,
                     WindowContents, VGroup,
                         Child, updaterObj = NewObject(updater->mcc_Class, NULL, 
@@ -1573,153 +2165,269 @@ void MUIMain()
                             /* Page 1: Status - live gauges for JIT and RasPi core */
                             Child, VGroup,
                                 InnerSpacing(4, 4),
-                                Child, ColGroup(2),
-                                    Child, Label("M68k speed:"),
-                                    Child, MIPS_M68k = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 10,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
-                                    End,
-                                    Child, Label("ARM speed:"),
-                                    Child, MIPS_ARM = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 10,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
-                                    End,
-                                    Child, Label("Effectiveness:"),
-                                    Child, Effectiveness = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 100,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld%%",
-                                    End,
-                                    Child, Label("Cache usage:"),
-                                    Child, JITUsage = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 100,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld%% in use",
-                                    End,
-                                    Child, Label("JIT units:"),
-                                    Child, JITCount = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 10,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld units in cache",
-                                    End,
-                                    Child, Label("Cache misses:"),
-                                    Child, CacheMiss = GaugeObject,
-                                        GaugeFrame,
-                                        MUIA_Gauge_Max, 10,
-                                        MUIA_Gauge_Current, 0,
-                                        MUIA_Gauge_Horiz, TRUE,
-                                        MUIA_Gauge_InfoText, (LONG)"%ld per second",
-                                    End,
-                                    Child, Label("Temperature:"),
-                                    Child, CoreTemp = TextObject,
-                                        TextFrame,
-                                        MUIA_Text_Contents, "0.0",
-                                    End,
-                                    Child, Label("Voltage:"),
-                                    Child, CoreVolt = TextObject,
-                                        TextFrame,
-                                        MUIA_Text_Contents, "0",
+                                Child, VGroup,
+                                    GroupFrameT("CPU"),
+                                    Child, CPUGroup = ColGroup(2),
+                                        Child, Label68k = StatusLabel("68K speed:"),
+                                        Child, MIPS_M68k = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 10,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
+                                        End,
+                                        Child, LabelPPC = StatusLabel("PPC speed:"),
+                                        Child, MIPS_PPC = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 10,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
+                                        End,
+                                        Child, LabelARM = StatusLabel("ARM speed:"),
+                                        Child, MIPS_ARM = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 10,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
+                                        End,
+                                        Child, LabelEff = StatusLabel("Effectiveness:"),
+                                        Child, Effectiveness = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 100,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld%%",
+                                        End,
                                     End,
                                 End,
-                                Child, VSpace(0),
+                                Child, VGroup,
+                                    GroupFrameT("RPi"),
+                                    Child, ColGroup(2),
+                                        Child, StatusLabel("Clockrate:"),
+                                        Child, ClockRate = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 1800,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld MHz",
+                                        End,
+                                        Child, StatusLabel("Temperature:"),
+                                        Child, CoreTemp = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 100,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld\xB0" "C",
+                                        End,
+                                        Child, StatusLabel("Voltage:"),
+                                        Child, CoreVolt = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 1500,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld mV",
+                                        End,
+                                    End,
+                                End,
+								Child, VSpace(0),
+                                Child, VGroup,
+                                    GroupFrameT("Cache"),
+                                    Child, ColGroup(2),
+                                        Child, StatusLabel("JIT units:"),
+                                        Child, JITCount = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 10,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld units in cache",
+                                        End,
+                                        Child, StatusLabel("Cache usage:"),
+                                        Child, JITUsage = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 100,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld%% in use",
+                                        End,
+                                        Child, StatusLabel("Cache misses:"),
+                                        Child, CacheMiss = GaugeObject,
+                                            GaugeFrame,
+                                            MUIA_Gauge_Max, 10,
+                                            MUIA_Gauge_Current, 0,
+                                            MUIA_Gauge_Horiz, TRUE,
+                                            MUIA_Gauge_InfoText, (LONG)"%ld per second",
+                                        End,
+                                    End,
+                                End,
                             End,
 
                             /* Page 2: Control - JIT tuning */
                             Child, VGroup,
                                 InnerSpacing(4, 4),
-                                Child, ColGroup(2),
-                                    Child, Label("JIT instruction depth"),
-                                    Child, INSNDepth = SliderObject,
-                                        MUIA_Numeric_Min, 1,
-                                        MUIA_Numeric_Max, 256,
-                                        MUIA_Numeric_Value, 1,
-                                        MUIA_ShortHelp, (ULONG)"Maximal number of m68k instructions\ntranslated into single block of ARM code",
-                                    End,
-                                    Child, Label("JIT inlining range"),
-                                    Child, InlineRange = NewObject(logSlider->mcc_Class, NULL,
-                                        MUIA_Numeric_Min, 0,
-                                        MUIA_Numeric_Max, 16,
-                                        MUIA_Numeric_Value, 0,
-                                    TAG_DONE),
-                                    Child, Label("Inline loop count"),
-                                    Child, LoopCount = SliderObject,
-                                        MUIA_Numeric_Min, 1,
-                                        MUIA_Numeric_Max, 16,
-                                        MUIA_Numeric_Value, 1,
-                                    End,
-                                    Child, Label("CCR scan depth"),
-                                    Child, CCRDepth = SliderObject,
-                                        MUIA_Numeric_Min, 0,
-                                        MUIA_Numeric_Max, 31,
-                                        MUIA_Numeric_Value, 20,
-                                    End,
-                                    Child, Label("Soft flush threshold"),
-                                    Child, SoftThresh = SliderObject,
-                                        MUIA_Numeric_Min, 1,
-                                        MUIA_Numeric_Max, 4000,
-                                        MUIA_Numeric_Value, 1,
+                                Child, VGroup,
+                                    GroupFrameT("Settings"),
+                                    Child, ColGroup(2),
+										Child, VSpace(0),
+										Child, VSpace(0),
+                                        Child, Label("JIT instruction depth:"),
+                                        Child, INSNDepth = SliderObject,
+                                            MUIA_Numeric_Min, 1,
+                                            MUIA_Numeric_Max, 256,
+                                            MUIA_Numeric_Value, 1,
+                                            MUIA_ShortHelp, (ULONG)"Maximal number of m68k instructions\ntranslated into single block of ARM code",
+                                        End,
+                                        Child, Label("JIT inlining range:"),
+                                        Child, InlineRange = NewObject(logSlider->mcc_Class, NULL,
+                                            MUIA_Numeric_Min, 0,
+                                            MUIA_Numeric_Max, 16,
+                                            MUIA_Numeric_Value, 0,
+                                        TAG_DONE),
+                                        Child, Label("Inline loop count:"),
+                                        Child, LoopCount = SliderObject,
+                                            MUIA_Numeric_Min, 1,
+                                            MUIA_Numeric_Max, 16,
+                                            MUIA_Numeric_Value, 1,
+                                        End,
+                                        Child, Label("CCR scan depth:"),
+                                        Child, CCRDepth = SliderObject,
+                                            MUIA_Numeric_Min, 0,
+                                            MUIA_Numeric_Max, 31,
+                                            MUIA_Numeric_Value, 20,
+                                        End,
+                                        Child, Label("Soft flush threshold:"),
+                                        Child, SoftThresh = SliderObject,
+                                            MUIA_Numeric_Min, 1,
+                                            MUIA_Numeric_Max, 4000,
+                                            MUIA_Numeric_Value, 1,
+                                        End,
+										Child, VSpace(0),
+										Child, VSpace(0),
                                     End,
                                 End,
-                                Child, HGroup,
-                                    Child, SoftFlush = MUI_MakeObject(MUIO_Button, "Soft flush"),
-                                    Child, FastCache = MUI_MakeObject(MUIO_Button, "Fast cache"),
-                                    Child, SlowCHIP = MUI_MakeObject(MUIO_Button, "Slow CHIP"),
-                                    Child, SlowDBF = MUI_MakeObject(MUIO_Button, "Slow DBF"),
-                                    Child, BlitWait = MUI_MakeObject(MUIO_Button, "Blit wait"),
-                                    Child, CacheFlush = MUI_MakeObject(MUIO_Button, "Flush JIT cache"),
+                                Child, VGroup,
+                                    GroupFrameT("Options"),
+                                    Child, ColGroup(3),
+                                        Child, SoftFlush = MUI_MakeObject(MUIO_Button, "Soft flush"),
+                                        Child, FastCache = MUI_MakeObject(MUIO_Button, "Fast cache"),
+                                        Child, SlowCHIP = MUI_MakeObject(MUIO_Button, "Slow CHIP"),
+                                        Child, SlowDBF = MUI_MakeObject(MUIO_Button, "Slow DBF"),
+                                        Child, BlitWait = MUI_MakeObject(MUIO_Button, "Blit wait"),
+                                        Child, CacheFlush = MUI_MakeObject(MUIO_Button, "Flush JIT cache"),
+                                    End,
                                 End,
-                                Child, VSpace(0),
                             End,
 
                             /* Page 3: Debug - address range and trace toggles */
                             Child, VGroup,
                                 InnerSpacing(4, 4),
-                                Child, ColGroup(2),
-                                    Child, Label("Low debug addres (hex)"),
-                                    Child, DebugMin = StringObject,
-                                        StringFrame,
-                                        MUIA_String_Contents, "00000000",
-                                        MUIA_String_MaxLen, 9,
-                                        MUIA_String_Accept, "0123456789abcdefABCDEF",
-                                    End,
-                                    Child, Label("High debug addres (hex)"),
-                                    Child, DebugMax = StringObject,
-                                        StringFrame,
-                                        MUIA_String_Contents, "ffffffff",
-                                        MUIA_String_MaxLen, 9,
-                                        MUIA_String_Accept, "0123456789abcdefABCDEF",
+                                Child, VGroup,
+                                    GroupFrameT("Note"),
+                                    Child, TextObject,
+                                        MUIA_Text_Contents, (ULONG)
+										"\33c\n"
+										"A working serial link between\n"
+										"the Raspberry Pi and your PC/Mac\n"
+										"is required to use this feature"
+										"\n\33n",
                                     End,
                                 End,
-                                Child, HGroup,
-                                    Child, EnableDebug = MUI_MakeObject(MUIO_Button, "Debug"),
-                                    Child, EnableDisasm = MUI_MakeObject(MUIO_Button, "Disassemble"),
+                                Child, VGroup,
+                                    GroupFrameT("Range"),
+                                    Child, ColGroup(2),
+										Child, VSpace(0),
+										Child, VSpace(0),
+                                        Child, Label("Low debug addr (hex):"),
+                                        Child, DebugMin = StringObject,
+                                            StringFrame,
+                                            MUIA_String_Contents, "00000000",
+                                            MUIA_String_MaxLen, 9,
+                                            MUIA_String_Accept, "0123456789abcdefABCDEF",
+                                        End,
+                                        Child, Label("High debug addr (hex):"),
+                                        Child, DebugMax = StringObject,
+                                            StringFrame,
+                                            MUIA_String_Contents, "ffffffff",
+                                            MUIA_String_MaxLen, 9,
+                                            MUIA_String_Accept, "0123456789abcdefABCDEF",
+                                        End,
+										Child, VSpace(0),
+										Child, VSpace(0),
+                                    End,
                                 End,
-                                Child, VSpace(0),
+                                Child, VGroup,
+                                    GroupFrameT("Actions"),
+                                    Child, HGroup,
+                                        Child, EnableDebug = MUI_MakeObject(MUIO_Button, "Debug"),
+                                        Child, EnableDisasm = MUI_MakeObject(MUIO_Button, "Disassemble"),
+                                    End,
+                                End,
                             End,
 
-                            /* Page 4: About - placeholder for future content */
+                            /* Page 4: System - board/CPU/memory/firmware and Emu68 core details.
+                               The Scrollgroup/virtual group lives inside the "Information"
+                               frame itself, so only its rows scroll, not the whole page */
                             Child, VGroup,
+                                InnerSpacing(4, 4),
+                                Child, VGroup,
+                                    GroupFrameT("Information"),
+                                    Child, ScrollgroupObject,
+                                        MUIA_Scrollgroup_FreeHoriz, FALSE,
+                                        MUIA_Scrollgroup_Contents, ColGroupV(2),
+                                        Child, InfoLabel("Variant:"),
+                                        Child, InfoValue(sysInfo.variant),
+                                        Child, InfoLabel("Model:"),
+                                        Child, InfoValue(sysInfo.model),
+                                        Child, InfoLabel("Revision:"),
+                                        Child, InfoValue(sysInfo.revision),
+                                        Child, InfoLabel("Chipset:"),
+                                        Child, InfoValue(sysInfo.chipset),
+                                        Child, InfoLabel("Manufacturer:"),
+                                        Child, InfoValue(sysInfo.manufacturer),
+                                        Child, InfoLabel("Processor:"),
+                                        Child, InfoValue(sysInfo.processor),
+                                        Child, InfoLabel("Memory size:"),
+                                        Child, InfoValue(sysInfo.memory),
+                                        Child, InfoLabel("Frame size:"),
+                                        Child, InfoValue(sysInfo.frame),
+                                        Child, InfoLabel("Firmware:"),
+                                        Child, InfoValue(sysInfo.firmware),
+                                        Child, InfoLabel("Uptime:"),
+                                        Child, InfoValue(sysInfo.uptime),
+                                        Child, InfoLabel("Serial-number:"),
+                                        Child, InfoValue(sysInfo.serial),
+                                        Child, InfoLabel("MAC address:"),
+                                        Child, InfoValue(sysInfo.mac),
+                                        Child, InfoLabel("Turbo mode:"),
+                                        Child, InfoValue(sysInfo.turbo),
+                                        Child, InfoLabel("Over voltage:"),
+                                        Child, InfoValue(sysInfo.overVoltage),
+										Child, VSpace(0),
+                                        End,
+                                    End,
+                                End,
+                            End,
+
+                            /* Page 5: About - borderless frame filling the whole page.
+                               Plain (non-textured) background so the logo's emboss
+                               edge reads clearly instead of blending into noise */
+                            Child, VGroup,
+                                GroupFrame,
+                                MUIA_Background, MUII_WindowBack,
+                                Child, VSpace(0),
+                                Child, HGroup,
+                                    Child, HSpace(0),
+                                    Child, NewObject(emuLogo->mcc_Class, NULL, TAG_DONE),
+                                    Child, HSpace(0),
+                                End,
                                 Child, VSpace(0),
                                 Child, TextObject,
-                                    MUIA_Text_Contents, (ULONG)"\33c" APPNAME,
+                                    MUIA_Font, MUIV_Font_Big,
+                                    MUIA_Text_Contents, (ULONG)"\33c" MUIX_B APPNAME " " APP_VERSION MUIX_N,
                                 End,
                                 Child, TextObject,
-                                    MUIA_Text_Contents, (ULONG)"\33cPiStorm / Emu68 JIT control panel",
-                                End,
-                                Child, TextObject,
-                                    MUIA_Text_Contents, (ULONG)"\33c(C) 2022-2023 Michal Schulz",
+                                    MUIA_Text_Contents, (ULONG)aboutBody,
                                 End,
                                 Child, VSpace(0),
                             End,
@@ -1749,11 +2457,49 @@ void MUIMain()
             DoMethod(MenuDefaults, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_ResetToDefaults);
 
+            /* Show/hide each Status page row (label + gauge together) as its
+               "Edit" menu checkbox is toggled. A plain MUIA_ShowMe toggle is a
+               known MUI rough edge (rows didn't actually hide) - instead the
+               row is physically removed from/re-added to CPUGroup under
+               InitChange/ExitChange, same fix as DoToggleSearch() in
+               Emu68DeviceTree's GUI.c. All four checkboxes share one hook
+               that rebuilds the whole row list, so relative order never gets
+               scrambled by OM_ADDMEMBER always appending at the end */
+            DoMethod(MenuShow68k, MUIM_Notify, MUIA_Menuitem_Checked, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_RebuildCPURows);
+            DoMethod(MenuShowPPC, MUIM_Notify, MUIA_Menuitem_Checked, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_RebuildCPURows);
+            DoMethod(MenuShowARM, MUIM_Notify, MUIA_Menuitem_Checked, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_RebuildCPURows);
+            DoMethod(MenuShowEff, MUIM_Notify, MUIA_Menuitem_Checked, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_RebuildCPURows);
+
+            /* Apply the tooltype-derived defaults now that the menu items and
+               CPUGroup both exist, in case any of them started unchecked */
+            RebuildCPURows();
+
             DoMethod(MenuOpen, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_LoadPreset);
 
             DoMethod(MenuSaveAs, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_SavePreset);
+
+            DoMethod(MenuIconify, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)app, 3, MUIM_Set, MUIA_Application_Iconified, TRUE);
+
+            /* Persists MainWindow's position/size (MUIA_Window_ID above) to
+               ENVARC: via the same mechanism as MUI's own Settings "Save" */
+            DoMethod(MenuSaveWinPos, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_Application_Save, (ULONG)MUIV_Application_Save_ENVARC);
+
+            DoMethod(MenuMUISettings, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)app, 3, MUIM_Application_OpenConfigWindow, 0UL, 0UL);
+
+            DoMethod(MenuAbout, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)TabGroup, 3, MUIM_Set, MUIA_Group_ActivePage, 4);
+
+            DoMethod(MenuAboutMUI, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_Application_AboutMUI, (ULONG)MainWindow);
 
             set(SoftFlush, MUIA_InputMode, MUIV_InputMode_Toggle);
             set(FastCache, MUIA_InputMode, MUIV_InputMode_Toggle);
@@ -1785,6 +2531,15 @@ void MUIMain()
                     UserState(ssp);
 
                 set(SoftThresh, MUIA_Numeric_Value, thresh);
+
+                if (MailBox || MailboxBase)
+                {
+                    ULONG clock_max_mhz = get_clock_rate_max(3) / 1000000;
+
+                    if (clock_max_mhz != 0)
+                        set(ClockRate, MUIA_Gauge_Max, clock_max_mhz);
+                }
+
                 if (debug_ctrl & 3)
                     set(EnableDebug, MUIA_Selected, TRUE);
                 if (debug_ctrl & 4)
@@ -1887,6 +2642,7 @@ void MUIMain()
         }
         MUI_DeleteCustomClass(logSlider);
         MUI_DeleteCustomClass(updater);
+        MUI_DeleteCustomClass(emuLogo);
     }
 }
 
@@ -1949,16 +2705,58 @@ enum {
 
 LONG result[OPT_COUNT];
 
-int main(int wantGUI)
+/* Reads the program's own Workbench icon (if launched from Workbench) and
+   applies the HIDE68KSTATUS/HIDEPPCSTATUS/HIDEARMSTATUS/HIDEEFFICIENCY
+   tooltypes, if present, as the initial state of the matching "Edit" menu
+   checkbox - presence of the tooltype means "start hidden" */
+void ReadShowToolTypes(struct WBStartup *wbmsg)
+{
+    if (wbmsg == NULL || wbmsg->sm_NumArgs < 1)
+        return;
+
+    IconBase = OpenLibrary("icon.library", 37);
+
+    if (IconBase != NULL)
+    {
+        struct WBArg *wa = &wbmsg->sm_ArgList[0];
+        BPTR oldDir = CurrentDir(wa->wa_Lock);
+        struct DiskObject *dobj = GetDiskObject(wa->wa_Name);
+
+        CurrentDir(oldDir);
+
+        if (dobj != NULL)
+        {
+            CONST_STRPTR *toolTypes = (CONST_STRPTR *)dobj->do_ToolTypes;
+
+            if (FindToolType(toolTypes, "HIDE68KSTATUS"))
+                Show68kDefault = FALSE;
+            if (FindToolType(toolTypes, "HIDEPPCSTATUS"))
+                ShowPPCDefault = FALSE;
+            if (FindToolType(toolTypes, "HIDEARMSTATUS"))
+                ShowARMDefault = FALSE;
+            if (FindToolType(toolTypes, "HIDEEFFICIENCY"))
+                ShowEffDefault = FALSE;
+
+            FreeDiskObject(dobj);
+        }
+
+        CloseLibrary(IconBase);
+        IconBase = NULL;
+    }
+}
+
+int main(int wantGUI, struct WBStartup *wbmsg)
 {
     struct RDArgs *args;
     SysBase = *(struct ExecBase **)4;
-    
+
     InitMailBox();
 
     DOSBase = (struct DosLibrary *)OpenLibrary("dos.library", 37);
     if (DOSBase == NULL)
         return -1;
+
+    ReadShowToolTypes(wbmsg);
 
     AslBase = OpenLibrary("asl.library", 0);
     if (AslBase == NULL) {

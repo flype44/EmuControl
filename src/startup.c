@@ -1,8 +1,9 @@
 #include <exec/types.h>
 #include <dos/dosextens.h>
+#include <workbench/startup.h>
 #include <proto/exec.h>
 
-int main(int);
+int main(int, struct WBStartup *);
 
 /* Startup code including workbench message support */
 int __attribute__((used)) _start()
@@ -20,7 +21,7 @@ int __attribute__((used)) _start()
         wbmsg = (struct WBStartup *)GetMsg(&p->pr_MsgPort);
     }
 
-    ret = main(wbmsg ? 1 : 0);
+    ret = main(wbmsg ? 1 : 0, wbmsg);
 
     if (wbmsg)
     {
