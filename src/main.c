@@ -53,6 +53,9 @@ BOOL ShowPPCDefault = TRUE;
 BOOL ShowARMDefault = TRUE;
 BOOL ShowEffDefault = TRUE;
 
+/* COMPACTMODE tooltype default - see ReadShowToolTypes() */
+BOOL CompactModeDefault = FALSE;
+
 #define APPNAME "EmuControl"
 
 static const char version[] __attribute__((used)) = "$VER: " VERSION_STRING;
@@ -62,10 +65,11 @@ Object *app;
 Object *MainWindow, *INSNDepth, *InlineRange, *LoopCount, *SoftFlush, *CacheFlush, *FastCache, *SlowCHIP, *SlowDBF, *BlitWait;
 Object *TabGroup, *MIPS_M68k, *MIPS_PPC, *MIPS_ARM, *JITUsage, *Effectiveness, *CacheMiss, *SoftThresh, *ClockRate;
 Object *Label68k, *LabelPPC, *LabelARM, *LabelEff, *CPUGroup;
+Object *MainContentGroup, *StatusPageGroup, *CPUFrame, *RPiFrame, *CacheFrame, *StatusSpacer;
 Object *JITCount, *EnableDebug, *EnableDisasm, *DebugMin, *DebugMax, *CoreTemp, *CoreVolt, *CCRDepth;
 Object *MenuOpen, *MenuSaveAs, *MenuQuit, *MenuDefaults;
 Object *MenuIconify, *MenuSaveWinPos, *MenuMUISettings, *MenuAbout, *MenuAboutMUI;
-Object *MenuShow68k, *MenuShowPPC, *MenuShowARM, *MenuShowEff;
+Object *MenuShow68k, *MenuShowPPC, *MenuShowARM, *MenuShowEff, *MenuCompactMode;
 
 /*
     Some properties, like e.g. #size-cells, are not always available in a key, but in that case the properties
@@ -1616,6 +1620,55 @@ ULONG RebuildCPURows()
     return 0;
 }
 
+/* Compact mode: pull CPUFrame out of the Status page and float it directly in
+   the window, hiding TabGroup entirely (every other frame and every other
+   tab). Leaving compact mode puts TabGroup back and rebuilds StatusPageGroup
+   in its original order, since OM_ADDMEMBER always appends at the end -
+   same InitChange/ExitChange + REMMEMBER/ADDMEMBER technique as
+   RebuildCPURows(), just one level higher in the object tree */
+ULONG ToggleCompactMode()
+{
+    ULONG compact;
+
+    get(MenuCompactMode, MUIA_Menuitem_Checked, &compact);
+
+    if (compact)
+    {
+        DoMethod(StatusPageGroup, MUIM_Group_InitChange);
+        DoMethod(StatusPageGroup, OM_REMMEMBER, (ULONG)CPUFrame);
+        DoMethod(StatusPageGroup, MUIM_Group_ExitChange);
+
+        DoMethod(MainContentGroup, MUIM_Group_InitChange);
+        DoMethod(MainContentGroup, OM_REMMEMBER, (ULONG)TabGroup);
+        DoMethod(MainContentGroup, OM_ADDMEMBER, (ULONG)CPUFrame);
+        DoMethod(MainContentGroup, MUIM_Group_ExitChange);
+
+        /* Keep the frame border, just drop its title while floating alone */
+        set(CPUFrame, MUIA_FrameTitle, (ULONG)NULL);
+    }
+    else
+    {
+        DoMethod(MainContentGroup, MUIM_Group_InitChange);
+        DoMethod(MainContentGroup, OM_REMMEMBER, (ULONG)CPUFrame);
+        DoMethod(MainContentGroup, OM_ADDMEMBER, (ULONG)TabGroup);
+        DoMethod(MainContentGroup, MUIM_Group_ExitChange);
+
+        set(CPUFrame, MUIA_FrameTitle, (ULONG)"CPU");
+
+        DoMethod(StatusPageGroup, MUIM_Group_InitChange);
+        DoMethod(StatusPageGroup, OM_REMMEMBER, (ULONG)RPiFrame);
+        DoMethod(StatusPageGroup, OM_REMMEMBER, (ULONG)StatusSpacer);
+        DoMethod(StatusPageGroup, OM_REMMEMBER, (ULONG)CacheFrame);
+        DoMethod(StatusPageGroup, OM_ADDMEMBER, (ULONG)CPUFrame);
+        DoMethod(StatusPageGroup, OM_ADDMEMBER, (ULONG)RPiFrame);
+        DoMethod(StatusPageGroup, OM_ADDMEMBER, (ULONG)StatusSpacer);
+        DoMethod(StatusPageGroup, OM_ADDMEMBER, (ULONG)CacheFrame);
+        DoMethod(StatusPageGroup, MUIM_Group_ExitChange);
+    }
+
+    return 0;
+}
+
 struct Hook hook_INSNDepth = {
     .h_Entry = ChangeINSNDepth
 };
@@ -1684,6 +1737,10 @@ struct Hook hook_RebuildCPURows = {
     .h_Entry = RebuildCPURows
 };
 
+struct Hook hook_ToggleCompactMode = {
+    .h_Entry = ToggleCompactMode
+};
+
 struct Hook hook_SavePreset = {
     .h_Entry = DoSavePreset
 };
@@ -1707,6 +1764,17 @@ static CONST_STRPTR RegisterTitles[] = { "Status", "JIT", "Debug", "System", "Ab
     MUIA_Text_Contents, (ULONG)(text), \
     MUIA_Text_PreParse, (ULONG)MUIX_R, \
     MUIA_FixWidthTxt, (ULONG)"Effectiveness    ", \
+    End
+
+/* CPU frame label: fixed width computed once in MUIMain() via TextLength()
+   against the real font (cpuLabelWidth), instead of a padded FixWidthTxt
+   sample - shared by both the normal Status page layout and compact mode,
+   since CPUGroup is the same live object in both */
+#define CPULabel(text) TextObject, \
+    MUIA_Font, MUIV_Font_Button, \
+    MUIA_Text_Contents, (ULONG)(text), \
+    MUIA_Text_PreParse, (ULONG)MUIX_R, \
+    MUIA_FixWidth, cpuLabelWidth, \
     End
 
 /* Fixed-width label for the System page, same rationale as StatusLabel */
@@ -2049,6 +2117,24 @@ void MUIMain()
     static char emu68VersionLine[64];
     static char aboutBody[256];
     static struct SystemPageInfo sysInfo;
+    LONG cpuLabelWidth = 100; /* fallback if LockPubScreen fails */
+
+    /* CPU frame labels need a fixed width (see CPULabel below) so they line up
+       in a single ColGroup, but MUIA_FixWidth can only be set at creation time,
+       before any window (and its RastPort) exists - measure against the
+       current public screen's font instead of guessing/padding a width by
+       hand. "Effectiveness:" is the longest of the four labels */
+    {
+        struct Screen *pubscreen = LockPubScreen(NULL);
+
+        if (pubscreen)
+        {
+            cpuLabelWidth = TextLength(&pubscreen->RastPort, "Effectiveness:",
+                sizeof("Effectiveness:") - 1) + 8;
+
+            UnlockPubScreen(NULL, pubscreen);
+        }
+    }
 
     GetEmu68VersionLine(emu68VersionLine);
     _sprintf(aboutBody,
@@ -2149,26 +2235,36 @@ void MUIMain()
                             MUIA_Menuitem_Toggle, TRUE,
                             MUIA_Menuitem_Checked, ShowEffDefault,
                         End,
+                        MUIA_Family_Child, MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)NM_BARLABEL,
+                        End,
+                        MUIA_Family_Child, MenuCompactMode = MenuitemObject,
+                            MUIA_Menuitem_Title, (ULONG)"Compact mode",
+                            MUIA_Menuitem_Shortcut, (ULONG)"M",
+                            MUIA_Menuitem_Checkit, TRUE,
+                            MUIA_Menuitem_Toggle, TRUE,
+                            MUIA_Menuitem_Checked, CompactModeDefault,
+                        End,
                     End,
                 End,
 
                 SubWindow, MainWindow = WindowObject,
                     MUIA_Window_ID, 0x4D41494E, /* 'MAIN' - lets MUI persist position/size */
                     MUIA_Window_Title, (ULONG)APPNAME,
-                    WindowContents, VGroup,
-                        Child, updaterObj = NewObject(updater->mcc_Class, NULL, 
+                    WindowContents, MainContentGroup = VGroup,
+                        Child, updaterObj = NewObject(updater->mcc_Class, NULL,
                             MUIA_ShowMe, FALSE,
                         TAG_DONE),
                         Child, TabGroup = RegisterObject,
                             MUIA_Register_Titles, (ULONG)RegisterTitles,
 
                             /* Page 1: Status - live gauges for JIT and RasPi core */
-                            Child, VGroup,
+                            Child, StatusPageGroup = VGroup,
                                 InnerSpacing(4, 4),
-                                Child, VGroup,
+                                Child, CPUFrame = VGroup,
                                     GroupFrameT("CPU"),
                                     Child, CPUGroup = ColGroup(2),
-                                        Child, Label68k = StatusLabel("68K speed:"),
+                                        Child, Label68k = CPULabel("68K speed:"),
                                         Child, MIPS_M68k = GaugeObject,
                                             GaugeFrame,
                                             MUIA_Gauge_Max, 10,
@@ -2176,7 +2272,7 @@ void MUIMain()
                                             MUIA_Gauge_Horiz, TRUE,
                                             MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
                                         End,
-                                        Child, LabelPPC = StatusLabel("PPC speed:"),
+                                        Child, LabelPPC = CPULabel("PPC speed:"),
                                         Child, MIPS_PPC = GaugeObject,
                                             GaugeFrame,
                                             MUIA_Gauge_Max, 10,
@@ -2184,7 +2280,7 @@ void MUIMain()
                                             MUIA_Gauge_Horiz, TRUE,
                                             MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
                                         End,
-                                        Child, LabelARM = StatusLabel("ARM speed:"),
+                                        Child, LabelARM = CPULabel("ARM speed:"),
                                         Child, MIPS_ARM = GaugeObject,
                                             GaugeFrame,
                                             MUIA_Gauge_Max, 10,
@@ -2192,7 +2288,7 @@ void MUIMain()
                                             MUIA_Gauge_Horiz, TRUE,
                                             MUIA_Gauge_InfoText, (LONG)"%ld MIPS",
                                         End,
-                                        Child, LabelEff = StatusLabel("Effectiveness:"),
+                                        Child, LabelEff = CPULabel("Effectiveness:"),
                                         Child, Effectiveness = GaugeObject,
                                             GaugeFrame,
                                             MUIA_Gauge_Max, 100,
@@ -2202,7 +2298,7 @@ void MUIMain()
                                         End,
                                     End,
                                 End,
-                                Child, VGroup,
+                                Child, RPiFrame = VGroup,
                                     GroupFrameT("RPi"),
                                     Child, ColGroup(2),
                                         Child, StatusLabel("Clockrate:"),
@@ -2231,8 +2327,8 @@ void MUIMain()
                                         End,
                                     End,
                                 End,
-								Child, VSpace(0),
-                                Child, VGroup,
+								Child, StatusSpacer = VSpace(0),
+                                Child, CacheFrame = VGroup,
                                     GroupFrameT("Cache"),
                                     Child, ColGroup(2),
                                         Child, StatusLabel("JIT units:"),
@@ -2478,6 +2574,20 @@ void MUIMain()
                CPUGroup both exist, in case any of them started unchecked */
             RebuildCPURows();
 
+            DoMethod(MenuCompactMode, MUIM_Notify, MUIA_Menuitem_Checked, MUIV_EveryTime,
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_ToggleCompactMode);
+
+            /* Apply COMPACTMODE tooltype default now that MainContentGroup,
+               StatusPageGroup and CPUFrame all exist. Only call this when
+               actually entering compact mode: the object graph is already
+               correct for normal mode as constructed above, and running the
+               "leave compact mode" branch against that already-normal state
+               would REMMEMBER/ADDMEMBER objects that aren't (or already are)
+               members of the wrong group, corrupting MUI's internal member
+               list badly enough to hang the whole machine, not just Guru */
+            if (CompactModeDefault)
+                ToggleCompactMode();
+
             DoMethod(MenuOpen, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_LoadPreset);
 
@@ -2708,7 +2818,8 @@ LONG result[OPT_COUNT];
 /* Reads the program's own Workbench icon (if launched from Workbench) and
    applies the HIDE68KSTATUS/HIDEPPCSTATUS/HIDEARMSTATUS/HIDEEFFICIENCY
    tooltypes, if present, as the initial state of the matching "Edit" menu
-   checkbox - presence of the tooltype means "start hidden" */
+   checkbox - presence of the tooltype means "start hidden". COMPACTMODE
+   starts the window in compact mode (CPU frame only) */
 void ReadShowToolTypes(struct WBStartup *wbmsg)
 {
     if (wbmsg == NULL || wbmsg->sm_NumArgs < 1)
@@ -2736,6 +2847,8 @@ void ReadShowToolTypes(struct WBStartup *wbmsg)
                 ShowARMDefault = FALSE;
             if (FindToolType(toolTypes, "HIDEEFFICIENCY"))
                 ShowEffDefault = FALSE;
+            if (FindToolType(toolTypes, "COMPACTMODE"))
+                CompactModeDefault = TRUE;
 
             FreeDiskObject(dobj);
         }
