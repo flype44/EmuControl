@@ -1748,6 +1748,25 @@ ULONG ToggleCompactMode()
     return 0;
 }
 
+/* "About EmuControl" menu item: leave Compact mode first if active, since
+   TabGroup (and every tab, About included) is detached from the window
+   while compact - otherwise switching ActivePage would have no visible
+   effect. Unchecking MenuCompactMode fires its own existing Notify/hook,
+   which does the actual CPUFrame/TabGroup swap */
+ULONG ShowAboutTab()
+{
+    ULONG compact;
+
+    get(MenuCompactMode, MUIA_Menuitem_Checked, &compact);
+
+    if (compact)
+        set(MenuCompactMode, MUIA_Menuitem_Checked, FALSE);
+
+    set(TabGroup, MUIA_Group_ActivePage, 4);
+
+    return 0;
+}
+
 struct Hook hook_INSNDepth = {
     .h_Entry = ChangeINSNDepth
 };
@@ -1814,6 +1833,10 @@ struct Hook hook_ResetToDefaults = {
 
 struct Hook hook_RebootRPi = {
     .h_Entry = DoRebootRPi
+};
+
+struct Hook hook_ShowAboutTab = {
+    .h_Entry = ShowAboutTab
 };
 
 struct Hook hook_RebuildCPURows = {
@@ -2670,7 +2693,7 @@ void MUIMain()
                 (ULONG)app, 3, MUIM_Application_OpenConfigWindow, 0UL, 0UL);
 
             DoMethod(MenuAbout, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
-                (ULONG)TabGroup, 3, MUIM_Set, MUIA_Group_ActivePage, 4);
+                (ULONG)app, 2, MUIM_CallHook, (ULONG)&hook_ShowAboutTab);
 
             DoMethod(MenuAboutMUI, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
                 (ULONG)app, 2, MUIM_Application_AboutMUI, (ULONG)MainWindow);
