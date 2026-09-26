@@ -1,5 +1,6 @@
 #include <exec/types.h>
 #include <exec/execbase.h>
+#include <exec/memory.h>
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <intuition/classes.h>
@@ -1900,48 +1901,16 @@ static void FormatSizeWhole(char *buf, ULONG bytes)
     _sprintf(buf, "%ld %s", bytes, units[unit]);
 }
 
-/* Finds "key" in a devicetree bootargs-style string and parses the number that
-   immediately follows it, in the given base (10 or 16) - same idea as
-   Emu68Info's GetField(), hand-rolled since this freestanding build has no
-   strstr()/strtol() */
-static LONG GetBootArgField(CONST_STRPTR bootargs, const char *key, int base)
+/* Formats a byte size as "N.NN GB" specifically (used for the RPi total on
+   the System page). Avoids the *100 overflow a naive "remainder*100/1GB"
+   would hit in 32-bit math by dividing the 1GB divisor down instead */
+static void FormatMemoryGB(char *buf, ULONG bytes)
 {
-    CONST_STRPTR h = bootargs;
+    ULONG whole = bytes / (1024UL * 1024 * 1024);
+    ULONG remainder = bytes % (1024UL * 1024 * 1024);
+    ULONG frac = remainder / 10737419; /* (1<<30)/100, rounded */
 
-    if (!h)
-        return 0;
-
-    while (*h)
-    {
-        CONST_STRPTR hh = h;
-        const char *kk = key;
-
-        while (*kk && *hh == *kk) { hh++; kk++; }
-
-        if (*kk == 0)
-        {
-            LONG value = 0;
-
-            while (*hh)
-            {
-                int digit;
-
-                if (*hh >= '0' && *hh <= '9') digit = *hh - '0';
-                else if (base == 16 && *hh >= 'a' && *hh <= 'f') digit = *hh - 'a' + 10;
-                else if (base == 16 && *hh >= 'A' && *hh <= 'F') digit = *hh - 'A' + 10;
-                else break;
-
-                value = value * base + digit;
-                hh++;
-            }
-
-            return value;
-        }
-
-        h++;
-    }
-
-    return 0;
+    _sprintf(buf, "%ld.%02ld GB", whole, frac);
 }
 
 /* 64-bit-by-32-bit unsigned division using the 68020+/68040 extended divu.l,
@@ -2046,7 +2015,6 @@ static void GetSystemPageInfo(struct SystemPageInfo *info)
 
     CONST_STRPTR variant = GetDTString("/emu68", "variant", "unknown");
     CONST_STRPTR cpu = GetDTString("/cpus/cpu@0", "compatible", "unknown");
-    CONST_STRPTR bootargs = GetDTString("/chosen", "bootargs", NULL);
 
     ULONG rev = get_board_revision();
     ULONG overVoltage = (rev >> 31) & 1;
@@ -2056,7 +2024,7 @@ static void GetSystemPageInfo(struct SystemPageInfo *info)
     ULONG revision = rev & 0xf;
 
     ULONG hi, lo;
-    char sizeRPI[16], sizeARM[16], sizeGPU[16];
+    char sizeRPI[16], sizeGPU[16];
     char freqStr[24];
 
     _sprintf(info->variant, "%s", variant);
@@ -2074,22 +2042,27 @@ static void GetSystemPageInfo(struct SystemPageInfo *info)
     _sprintf(info->processor, "%s @ %s", cpu, freqStr);
 
     {
-        ULONG armMem = get_arm_memory_size();
+        /* AvailMem(MEMF_FAST|MEMF_TOTAL) reflects what Emu68 actually handed
+           to AmigaOS (i.e. board RAM minus the GPU carve-out minus whatever
+           Emu68's own kernel reserves for itself) - close to the truth and,
+           unlike the mailbox ARM_MEMORY tag, doesn't undercount versus the
+           board's real total (e.g. it showed 1GB total on a board whose
+           revision code decodes to an actual 2GB board) */
+        ULONG rpiTotal = AvailMem(MEMF_FAST | MEMF_TOTAL);
         ULONG vcMem = get_vc_memory_size();
 
-        /* bootargs ".mem_size=" isn't reliably present, so total from the
-           mailbox-reported ARM+GPU split instead - always available */
-        FormatSizeWhole(sizeRPI, armMem + vcMem);
-        FormatSizeWhole(sizeARM, armMem);
+        FormatMemoryGB(sizeRPI, rpiTotal);
         FormatSizeWhole(sizeGPU, vcMem);
     }
-    _sprintf(info->memory, "RPI %s, ARM %s, GPU %s", sizeRPI, sizeARM, sizeGPU);
+    _sprintf(info->memory, "System %s, GPU %s", sizeRPI, sizeGPU);
 
-    FormatFrequency(freqStr, get_clock_rate_measured(9));
-    _sprintf(info->frame, "%ld x %ld @ %s",
-        GetBootArgField(bootargs, ".fbwidth=", 10),
-        GetBootArgField(bootargs, ".fbheight=", 10),
-        freqStr);
+    {
+        ULONG fbWidth, fbHeight;
+
+        get_framebuffer_size(&fbWidth, &fbHeight);
+        FormatFrequency(freqStr, get_clock_rate_measured(9));
+        _sprintf(info->frame, "%ld x %ld @ %s", fbWidth, fbHeight, freqStr);
+    }
 
     GetFirmwareDateLine(info->firmware);
     GetUptimeLine(info->uptime);

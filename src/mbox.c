@@ -124,50 +124,6 @@ ULONG get_core_temperature()
     }
 }
 
-ULONG get_arm_memory_size()
-{
-    if (MailboxBase)
-    {
-        ULONG *FBReq = (ULONG*)__req;
-
-        FBReq[0] = 4*8;
-        FBReq[1] = 0;
-        FBReq[2] = 0x00010005; /* TAG_GET_ARM_MEMORY */
-        FBReq[3] = 8;
-        FBReq[4] = 0;
-        FBReq[5] = 0;
-        FBReq[6] = 0;
-        FBReq[7] = 0;
-
-        MB_RawCommand(FBReq);
-
-        return FBReq[6];
-    }
-    else
-    {
-        struct ExecBase *SysBase = *(struct ExecBase **)4;
-
-        ULONG *FBReq = (ULONG*)(((ULONG)__req + 31) & ~31);
-        ULONG len = 8*4;
-
-        FBReq[0] = LE32(4*8);
-        FBReq[1] = 0;
-        FBReq[2] = LE32(0x00010005);
-        FBReq[3] = LE32(8);
-        FBReq[4] = 0;
-        FBReq[5] = 0;
-        FBReq[6] = 0;
-        FBReq[7] = 0;
-
-        CachePreDMA(FBReq, &len, 0);
-        mbox_send(8, (ULONG)FBReq);
-        mbox_recv(8);
-        CachePostDMA(FBReq, &len, 0);
-
-        return LE32(FBReq[6]);
-    }
-}
-
 ULONG get_vc_memory_size()
 {
     if (MailboxBase)
@@ -580,6 +536,55 @@ void get_board_macaddr(ULONG *hi, ULONG *lo)
 
         if (hi) *hi = LE32(FBReq[5]);
         if (lo) *lo = LE32(FBReq[6]);
+    }
+}
+
+/* Physical (display) framebuffer size in pixels - cleaner and more reliable
+   than parsing ".fbwidth="/".fbheight=" out of the devicetree bootargs
+   string, which (like ".mem_size=") isn't guaranteed to be present */
+void get_framebuffer_size(ULONG *width, ULONG *height)
+{
+    if (MailboxBase)
+    {
+        ULONG *FBReq = (ULONG*)__req;
+
+        FBReq[0] = 4*8;
+        FBReq[1] = 0;
+        FBReq[2] = 0x00040003; /* TAG_GET_PHYSICAL_SIZE */
+        FBReq[3] = 8;
+        FBReq[4] = 0;
+        FBReq[5] = 0;
+        FBReq[6] = 0;
+        FBReq[7] = 0;
+
+        MB_RawCommand(FBReq);
+
+        if (width) *width = FBReq[5];
+        if (height) *height = FBReq[6];
+    }
+    else
+    {
+        struct ExecBase *SysBase = *(struct ExecBase **)4;
+
+        ULONG *FBReq = (ULONG*)(((ULONG)__req + 31) & ~31);
+        ULONG len = 8*4;
+
+        FBReq[0] = LE32(4*8);
+        FBReq[1] = 0;
+        FBReq[2] = LE32(0x00040003);
+        FBReq[3] = LE32(8);
+        FBReq[4] = 0;
+        FBReq[5] = 0;
+        FBReq[6] = 0;
+        FBReq[7] = 0;
+
+        CachePreDMA(FBReq, &len, 0);
+        mbox_send(8, (ULONG)FBReq);
+        mbox_recv(8);
+        CachePostDMA(FBReq, &len, 0);
+
+        if (width) *width = LE32(FBReq[5]);
+        if (height) *height = LE32(FBReq[6]);
     }
 }
 
