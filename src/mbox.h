@@ -16,7 +16,6 @@ ULONG get_turbo_mode();
 void get_board_serial(ULONG *hi, ULONG *lo);
 void get_board_macaddr(ULONG *hi, ULONG *lo);
 void get_framebuffer_size(ULONG *width, ULONG *height);
-void reset_usb_controller();
 void reboot_rpi_firmware(BOOL kill_exec);
 
 #endif /* _MBOX_H */

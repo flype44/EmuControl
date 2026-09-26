@@ -621,50 +621,6 @@ void get_framebuffer_size(ULONG *width, ULONG *height)
     }
 }
 
-/* Resets the onboard USB (xHCI/VL805) controller via the VC4 firmware, same
-   mechanism as Linux's reset-raspberrypi.c driver: devicetree confirms
-   /soc/firmware/reset (compatible "raspberrypi,firmware-reset", #reset-cells
-   = 1) is the reset line USB references (its "resets" property points at
-   that node's phandle with cell id 0). The firmware always resets with a
-   fixed 0 payload regardless of that id - there's only one reset line */
-void reset_usb_controller()
-{
-    if (MailboxBase)
-    {
-        ULONG *FBReq = (ULONG*)__req;
-
-        FBReq[0] = 4*7;
-        FBReq[1] = 0;
-        FBReq[2] = 0x00030058; /* RPI_FIRMWARE_NOTIFY_XHCI_RESET */
-        FBReq[3] = 4;
-        FBReq[4] = 0;
-        FBReq[5] = 0;
-        FBReq[6] = 0;
-
-        MB_RawCommand(FBReq);
-    }
-    else
-    {
-        struct ExecBase *SysBase = *(struct ExecBase **)4;
-
-        ULONG *FBReq = (ULONG*)(((ULONG)__req + 31) & ~31);
-        ULONG len = 7*4;
-
-        FBReq[0] = LE32(4*7);
-        FBReq[1] = 0;
-        FBReq[2] = LE32(0x00030058);
-        FBReq[3] = LE32(4);
-        FBReq[4] = 0;
-        FBReq[5] = 0;
-        FBReq[6] = 0;
-
-        CachePreDMA(FBReq, &len, 0);
-        mbox_send(8, (ULONG)FBReq);
-        mbox_recv(8);
-        CachePostDMA(FBReq, &len, 0);
-    }
-}
-
 ULONG get_core_voltage()
 {
     if (MailboxBase)
